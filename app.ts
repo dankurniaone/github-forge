@@ -39,20 +39,13 @@ function nextRequestId(): string {
   return `forge-${requestCounter.toString(16).padStart(8, '0')}`;
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw). */
-function pathOf(req: IncomingMessage): string {
+/** The path and query of a request URL, from a single parse (never a throw). */
+function parseUrl(req: IncomingMessage): { path: string; query: URLSearchParams } {
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    const url = new URL(req.url ?? '/', 'http://entry');
+    return { path: url.pathname, query: url.searchParams };
   } catch {
-    return '/';
-  }
-}
-
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
+    return { path: '/', query: new URLSearchParams() };
   }
 }
 
@@ -72,8 +65,9 @@ function sendBuffer(res: ServerResponse, result: HttpResult, headers: Readonly<R
 function bearerToken(req: IncomingMessage): string | null {
   const header = req.headers['authorization'];
   if (typeof header !== 'string') return null;
-  const match = /^Bearer\s+(.+)$/.exec(header);
-  return match === null ? null : (match[1] as string);
+  if (!header.startsWith('Bearer ')) return null;
+  const token = header.slice(7);
+  return token === '' ? null : token;
 }
 
 /** True when the request carries an acceptable token. */
@@ -119,7 +113,7 @@ export function createApp(): Server {
 
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
-      const path = pathOf(req);
+      const { path, query } = parseUrl(req);
       const method = req.method ?? 'GET';
       const requestId = nextRequestId();
 
@@ -139,7 +133,6 @@ export function createApp(): Server {
         // REST v3.
         if (path === '/api/v3' || path === '/api/v3/' || path.startsWith('/api/v3/')) {
           const segments = path.split('/').filter((part) => part !== '').slice(2);
-          const query = queryOf(req);
           const host = req.headers['host'] ?? '127.0.0.1';
           let body: unknown;
           if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
@@ -208,7 +201,6 @@ export function createApp(): Server {
             return;
           }
           if (endpoint === 'info/refs' && method === 'GET') {
-            const query = queryOf(req);
             const service = query.get('service');
             if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
               sendJson(res, 400, { message: 'service is required' }, { 'x-github-request-id': requestId });

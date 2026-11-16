@@ -139,22 +139,63 @@ function sidebandPackets(pack: Buffer): Buffer {
 }
 
 /** Build the pack for a fetch: wanted objects minus held ones, in oid order. */
-function buildFetchPack(
+interface FetchPackResult {
+  pack: Buffer;
+  boundary: string[];
+  unshallow: string[];
+  common: string[];
+}
+
+/**
+ * The fetch-pack cache: one entry per (wants, haves, depth, shallow) per repo.
+ * A pack for fixed wants/haves/depth depends only on the objects reachable from
+ * those wants, and objects are immutable — so the cache is exact as long as the
+ * object count is unchanged (a changed count means new objects exist). 50
+ * concurrent clones of one tip hit the same entry: one pack build, 49 reuses.
+ */
+const fetchPackCache = new WeakMap<Repo, Map<string, FetchPackResult>>();
+const FETCH_PACK_CACHE_MAX = 32;
+
+function cachedFetchPack(
   repo: Repo,
   args: FetchArgs,
-): { pack: Buffer; boundary: string[]; unshallow: string[]; common: string[] } {
-  const held = collectReachable(repo, args.haves, { stopAt: new Set(args.shallow) }).ids;
-  const wanted = collectReachable(repo, args.wants, { depth: args.depth ?? undefined });
-  const send: GitObject[] = [];
-  for (const oid of [...wanted.ids].sort()) {
-    if (held.has(oid)) continue;
-    const obj = getObject(repo, oid);
-    if (obj !== undefined) send.push(obj);
+  build: () => FetchPackResult,
+): FetchPackResult {
+  const key = [
+    [...args.wants].sort().join(','),
+    [...args.haves].sort().join(','),
+    String(args.depth),
+    [...args.shallow].sort().join(','),
+    String(repo.objects.size),
+  ].join('|');
+  let perRepo = fetchPackCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map<string, FetchPackResult>();
+    fetchPackCache.set(repo, perRepo);
   }
-  const pack = writePack(send);
-  const unshallow = args.shallow.filter((oid) => wanted.commits.has(oid) && !wanted.boundary.includes(oid));
-  const common = args.haves.filter((oid) => wanted.ids.has(oid));
-  return { pack, boundary: wanted.boundary, unshallow, common };
+  const hit = perRepo.get(key);
+  if (hit !== undefined) return hit;
+  const built = build();
+  if (perRepo.size >= FETCH_PACK_CACHE_MAX) perRepo.clear();
+  perRepo.set(key, built);
+  return built;
+}
+
+function buildFetchPack(repo: Repo, args: FetchArgs): FetchPackResult {
+  return cachedFetchPack(repo, args, () => {
+    const held = collectReachable(repo, args.haves, { stopAt: new Set(args.shallow) }).ids;
+    const wanted = collectReachable(repo, args.wants, { depth: args.depth ?? undefined });
+    const send: GitObject[] = [];
+    for (const oid of [...wanted.ids].sort()) {
+      if (held.has(oid)) continue;
+      const obj = getObject(repo, oid);
+      if (obj !== undefined) send.push(obj);
+    }
+    const pack = writePack(send);
+    const unshallow = args.shallow.filter((oid) => wanted.commits.has(oid) && !wanted.boundary.includes(oid));
+    const common = args.haves.filter((oid) => wanted.ids.has(oid));
+    return { pack, boundary: wanted.boundary, unshallow, common };
+  });
 }
 
 function handleFetchV2(repo: Repo, args: FetchArgs): HttpResult {

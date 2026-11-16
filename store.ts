@@ -77,6 +77,37 @@ export interface Repo {
   createdSeq: number;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Parsed-commit cache: oid -> {tree, parents}. Objects are content-addressed
+   * and immutable, so a parsed commit never changes; chain walks (ancestry,
+   * reachability, commit lists) re-read the same commits constantly.
+   */
+  commitCache: Map<string, { tree: string; parents: string[] }>;
+  /** Parsed-tree cache: oid -> entries, for the same reason. */
+  treeCache: Map<string, TreeEntry[]>;
+}
+
+/** A commit's tree + parents, from the repo's cache (parse once, reuse forever). */
+export function commitView(repo: Repo, oid: string): { tree: string; parents: string[] } | null {
+  const cached = repo.commitCache.get(oid);
+  if (cached !== undefined) return cached;
+  const obj = repo.objects.get(oid);
+  if (obj === undefined || obj.type !== 'commit') return null;
+  const parsed = parseCommit(obj.data);
+  const view = { tree: parsed.tree, parents: parsed.parents };
+  repo.commitCache.set(oid, view);
+  return view;
+}
+
+/** A tree's entries, from the repo's cache (parse once, reuse forever). */
+export function treeView(repo: Repo, oid: string): TreeEntry[] | null {
+  const cached = repo.treeCache.get(oid);
+  if (cached !== undefined) return cached;
+  const obj = repo.objects.get(oid);
+  if (obj === undefined || obj.type !== 'tree') return null;
+  const entries = parseTree(obj.data);
+  repo.treeCache.set(oid, entries);
+  return entries;
 }
 
 /** ISO 8601 (UTC) for a Unix timestamp, computed arithmetically — no Date anywhere. */
@@ -169,6 +200,8 @@ export class Store {
       createdSeq: this.nextSeq,
       createdAt: now,
       updatedAt: now,
+      commitCache: new Map(),
+      treeCache: new Map(),
     };
     this.nextRepoId += 1;
     this.nextSeq += 1;
@@ -244,9 +277,9 @@ export function isAncestor(repo: Repo, ancestor: string, descendant: string): bo
     const oid = queue.pop() as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const obj = repo.objects.get(oid);
-    if (obj === undefined || obj.type !== 'commit') continue;
-    for (const parent of parseCommit(obj.data).parents) {
+    const view = commitView(repo, oid);
+    if (view === null) continue;
+    for (const parent of view.parents) {
       if (parent === ancestor) return true;
       queue.push(parent);
     }
@@ -260,10 +293,10 @@ export function addTreeClosure(repo: Repo, treeOid: string, into: Set<string>): 
   while (stack.length > 0) {
     const oid = stack.pop() as string;
     if (into.has(oid)) continue;
-    const obj = repo.objects.get(oid);
-    if (obj === undefined || obj.type !== 'tree') continue;
+    const entries = treeView(repo, oid);
+    if (entries === null) continue;
     into.add(oid);
-    for (const entry of parseTree(obj.data)) {
+    for (const entry of entries) {
       if (entry.mode === '40000') stack.push(entry.oid);
       else into.add(entry.oid);
     }
@@ -294,8 +327,8 @@ export function collectReachable(
   const commits = new Set<string>();
   const seen = new Set<string>();
   const queue: { oid: string; dist: number }[] = roots.map((oid) => ({ oid, dist: 0 }));
-  while (queue.length > 0) {
-    const { oid, dist } = queue.shift() as { oid: string; dist: number };
+  for (let head = 0; head < queue.length; head += 1) {
+    const { oid, dist } = queue[head] as { oid: string; dist: number };
     if (seen.has(oid)) continue;
     seen.add(oid);
     const obj = repo.objects.get(oid);
@@ -307,13 +340,14 @@ export function collectReachable(
     }
     if (obj.type !== 'commit') continue;
     commits.add(oid);
-    const commit = parseCommit(obj.data);
-    addTreeClosure(repo, commit.tree, ids);
+    const view = commitView(repo, oid);
+    if (view === null) continue;
+    addTreeClosure(repo, view.tree, ids);
     const cut = opts.depth !== undefined && dist + 1 >= opts.depth;
     const stop = opts.stopAt !== undefined && opts.stopAt.has(oid);
-    if (commit.parents.length > 0 && cut) boundary.push(oid);
+    if (view.parents.length > 0 && cut) boundary.push(oid);
     if (cut || stop) continue;
-    for (const parent of commit.parents) queue.push({ oid: parent, dist: dist + 1 });
+    for (const parent of view.parents) queue.push({ oid: parent, dist: dist + 1 });
   }
   return { ids, boundary, commits };
 }
@@ -322,9 +356,9 @@ export function collectReachable(
 export function flattenTree(repo: Repo, treeOid: string): Map<string, { oid: string; mode: string }> {
   const out = new Map<string, { oid: string; mode: string }>();
   const walk = (oid: string, prefix: string): void => {
-    const obj = repo.objects.get(oid);
-    if (obj === undefined || obj.type !== 'tree') return;
-    for (const entry of parseTree(obj.data)) {
+    const entries = treeView(repo, oid);
+    if (entries === null) return;
+    for (const entry of entries) {
       const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
       if (entry.mode === '40000') walk(entry.oid, path);
       else out.set(path, { oid: entry.oid, mode: entry.mode });
@@ -459,10 +493,10 @@ export function listCommits(repo: Repo, tip: string): string[] {
     const oid = stack.pop() as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const obj = repo.objects.get(oid);
-    if (obj === undefined || obj.type !== 'commit') continue;
+    const view = commitView(repo, oid);
+    if (view === null) continue;
     out.push(oid);
-    const parents = parseCommit(obj.data).parents;
+    const parents = view.parents;
     for (let i = parents.length - 1; i >= 0; i -= 1) stack.push(parents[i] as string);
   }
   return out;

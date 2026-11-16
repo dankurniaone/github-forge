@@ -215,6 +215,49 @@ function readOfsDeltaBase(buffer: Buffer, start: number): { baseOffset: number; 
 
 /** Inflate the zlib stream at `offset`; returns the data and the offset just past it. */
 export function inflateAt(buffer: Uint8Array, offset: number): { data: Buffer; next: number } {
+  // Fast path: one inflate of the tail (inflateSync stops at the stream's end and
+  // ignores trailing bytes), then find the stream's end by its Adler-32 trailer.
+  // The Adler value is verified against the inflated data, so a wrong guess is
+  // impossible to accept silently; anything doubtful falls back to the exact
+  // binary search below.
+  try {
+    const tail = buffer.subarray(offset);
+    const data = Buffer.from(zlibInflate(tail));
+    const needle = Buffer.allocUnsafe(4);
+    needle.writeUInt32BE(adler32(data), 0);
+    const at = tail.indexOf(needle, 2);
+    if (at >= 2 && at + 4 <= tail.length) {
+      return { data, next: offset + at + 4 };
+    }
+  } catch {
+    // Fall through to the exact search.
+  }
+  return inflateAtExact(buffer, offset);
+}
+
+/** Adler-32 of `data` (the checksum a zlib stream ends with), blocked to stay O(n). */
+export function adler32(data: Uint8Array): number {
+  let a = 1;
+  let b = 0;
+  // NMAX: the largest block over which a/b cannot overflow 32 bits.
+  const NMAX = 5552;
+  for (let start = 0; start < data.length; start += NMAX) {
+    const end = Math.min(data.length, start + NMAX);
+    for (let i = start; i < end; i += 1) {
+      a += data[i] as number;
+      b += a;
+    }
+    a %= 65521;
+    b %= 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
+ * The exact inflate: binary-search the smallest end offset whose slice inflates.
+ * Slow (one inflate per probe) but exact; the fallback when the fast path doubts.
+ */
+export function inflateAtExact(buffer: Uint8Array, offset: number): { data: Buffer; next: number } {
   // inflateSync ignores trailing bytes and throws on a truncated stream, so "the slice
   // inflates" is monotonic in the end offset: binary-search the smallest end that works.
   let lo = offset + 1;
@@ -311,51 +354,71 @@ interface RawEntry {
  * Read a packfile: verify the trailer, inflate every entry, resolve REF_DELTA and
  * OFS_DELTA entries against their bases (from the pack itself, or from `resolveBase`
  * for thin packs). Returns the resolved objects by id.
+ *
+ * The parse runs on the fast inflate first and is validated whole (entry count and
+ * the final offset landing exactly on the trailer); any inconsistency re-parses
+ * with the exact inflate, so a fast-path misread can never produce a wrong pack.
  */
 export function readPack(
   pack: Uint8Array,
   options: { resolveBase?: (oid: string) => GitObject | undefined } = {},
 ): PackReadResult {
-  if (pack.length < 32) throw new Error('pack too short');
-  if (Buffer.from(pack.subarray(0, 4)).toString('ascii') !== 'PACK') throw new Error('not a packfile');
-  const version = pack.readUInt32BE(4);
-  const declaredCount = pack.readUInt32BE(8);
-  const checksum = verifyPackChecksum(pack);
+  try {
+    return parsePack(pack, options, false);
+  } catch {
+    return parsePack(pack, options, true);
+  }
+}
+
+function parsePack(
+  pack: Uint8Array,
+  options: { resolveBase?: (oid: string) => GitObject | undefined },
+  exact: boolean,
+): PackReadResult {
+  const buf = Buffer.isBuffer(pack) ? pack : Buffer.from(pack);
+  if (buf.length < 32) throw new Error('pack too short');
+  if (buf.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('not a packfile');
+  const version = buf.readUInt32BE(4);
+  const declaredCount = buf.readUInt32BE(8);
+  const checksum = verifyPackChecksum(buf);
   if (!checksum.ok) throw new Error('pack trailer checksum mismatch');
+  const inflate = exact ? inflateAtExact : inflateAt;
   const raw: RawEntry[] = [];
   const byOffset = new Map<number, RawEntry>();
+  const byOid = new Map<string, RawEntry>();
   let offset = 12;
   for (let i = 0; i < declaredCount; i += 1) {
     const entryOffset = offset;
-    const { size, next, first } = readVarintSize(Buffer.from(pack), offset);
-    void size;
+    const { next, first } = readVarintSize(buf, offset);
     const type = (first >> 4) & 0x07;
     offset = next;
     if (type === 6) {
-      const { baseOffset, next: after } = readOfsDeltaBase(Buffer.from(pack), offset);
+      const { baseOffset, next: after } = readOfsDeltaBase(buf, offset);
       offset = after;
-      const { data, next: end } = inflateAt(pack, offset);
+      const { data, next: end } = inflate(buf, offset);
       offset = end;
       const entry: RawEntry = { type, data, oid: '', offset: entryOffset, ofsBase: entryOffset - baseOffset };
       raw.push(entry);
       byOffset.set(entryOffset, entry);
     } else if (type === 7) {
-      const refBase = Buffer.from(pack.subarray(offset, offset + 20)).toString('hex');
+      const refBase = buf.subarray(offset, offset + 20).toString('hex');
       offset += 20;
-      const { data, next: end } = inflateAt(pack, offset);
+      const { data, next: end } = inflate(buf, offset);
       offset = end;
       const entry: RawEntry = { type, data, oid: '', offset: entryOffset, refBase };
       raw.push(entry);
       byOffset.set(entryOffset, entry);
     } else {
-      const { data, next: end } = inflateAt(pack, offset);
+      const { data, next: end } = inflate(buf, offset);
       offset = end;
       const oid = hashObject(CODE_TYPE[type] as GitObjectType, data);
       const entry: RawEntry = { type, data, oid, offset: entryOffset };
       raw.push(entry);
       byOffset.set(entryOffset, entry);
+      byOid.set(oid, entry);
     }
   }
+  if (offset !== buf.length - 20) throw new Error('pack entries do not end at the trailer');
   const objects = new Map<string, GitObject>();
   let deltaCount = 0;
   const resolve = (entry: RawEntry, seen: Set<number>): { type: GitObjectType; data: Buffer; oid: string } => {
@@ -369,7 +432,7 @@ export function readPack(
         if (baseEntry === undefined) throw new Error('OFS_DELTA base outside pack');
         base = resolve(baseEntry, seen);
       } else {
-        const baseEntry = raw.find((candidate) => candidate.oid === entry.refBase);
+        const baseEntry = byOid.get(entry.refBase as string);
         if (baseEntry !== undefined) {
           base = resolve(baseEntry, seen);
         } else {
